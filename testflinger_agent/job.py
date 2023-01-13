@@ -12,7 +12,6 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>
 
-import fcntl
 import json
 import logging
 import os
@@ -114,17 +113,32 @@ class TestflingerJob:
         else:
             f.seek(0, 0)
 
+    def _send_output(self, output, logfile):
+        """Send output to the logfile and the server
+
+        :param output:
+            String containing the output to send
+        :param logfile:
+            Name of the logfile to send the output to
+        """
+        # Write the output to the local logfile
+        with open(logfile, "a", encoding="utf-8") as _file:
+            _file.write(output)
+
+        # Send the output to the server
+        self.client.post_live_output(self.job_id, output)
+
     def run_with_log(self, cmd, logfile, cwd=None):
-        """Execute command in a subprocess and log the output
+        """Run a command and log the output to a file
 
         :param cmd:
             Command to run
         :param logfile:
-            Filename to save the output in
+            Name of the logfile to send the output to
         :param cwd:
-            Path to run the command from
+            Directory in which to run the command
         :return:
-            returncode from the process
+            Returncode from the command that was executed
         """
         env = os.environ.copy()
         # Make sure there all values we add are strings
@@ -133,85 +147,66 @@ class TestflingerJob:
         )
         global_timeout = self.get_global_timeout()
         output_timeout = self.get_output_timeout()
-        start_time = time.time()
-        with open(logfile, "a", encoding="utf-8") as f:
-            live_output_buffer = ""
-            readpoll = select.poll()
-            buffer_timeout = time.time()
-            process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                shell=True,
-                cwd=cwd,
-                env=env,
-            )
+        start_time = last_output_time = time.time()
+        process = subprocess.Popen(  # pylint: disable=consider-using-with
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            shell=True,
+            cwd=cwd,
+            env=env,
+        )
+        # Make sure we don't block on the stdout pipe
+        os.set_blocking(process.stdout.fileno(), False)
 
-            def cleanup(signum, frame):
+        # Setup select.poll to check for output
+        readpoll = select.poll()
+        readpoll.register(process.stdout, select.POLLIN)
+
+        def cleanup(*_):
+            process.kill()
+
+        signal.signal(signal.SIGTERM, cleanup)
+
+        while True:
+            # This is just a fancy sleep(10) that stops early if we get output
+            readpoll.poll(10000)
+            output = process.stdout.read()
+            if output:
+                output = output.decode("utf-8", errors="replace")
+                # Reset the last_output_time
+                last_output_time = time.time()
+
+                # Write the output to the logfile and send it to the server
+                self._send_output(output, logfile)
+
+            # Check if we are exiting
+            if process.poll() is not None:
+                return _get_exit_code(process)
+
+            # Check for output timeout only during the test phase
+            if (
+                self.phase == "test"
+                and time.time() - last_output_time > output_timeout
+            ):
+                output = (
+                    f"\nERROR: Output timeout reached! ({output_timeout}s)\n"
+                )
+                self._send_output(output, logfile)
                 process.kill()
+                return _get_exit_code(process)
 
-            signal.signal(signal.SIGTERM, cleanup)
-            set_nonblock(process.stdout.fileno())
-            readpoll.register(process.stdout, select.POLLIN)
-            while process.poll() is None:
-                # Check if there's any new data, timeout after 10s
-                data_ready = readpoll.poll(10000)
-                if data_ready:
-                    buf = process.stdout.read().decode(
-                        sys.stdout.encoding, errors="replace"
-                    )
-                    if buf:
-                        sys.stdout.write(buf)
-                        live_output_buffer += buf
-                        f.write(buf)
-                        f.flush()
-                else:
-                    if (
-                        self.phase == "test"
-                        and time.time() - buffer_timeout > output_timeout
-                    ):
-                        buf = (
-                            "\nERROR: Output timeout reached! "
-                            "({}s)\n".format(output_timeout)
-                        )
-                        live_output_buffer += buf
-                        f.write(buf)
-                        process.kill()
-                        break
-                if (
-                    self.phase != "reserve"
-                    and time.time() - start_time > global_timeout
-                ):
-                    buf = "\nERROR: Global timeout reached! ({}s)\n".format(
-                        global_timeout
-                    )
-                    live_output_buffer += buf
-                    f.write(buf)
-                    process.kill()
-                    break
-                # Don't spam the server, only flush the buffer if there
-                # is output and it's been more than 10s
-                if live_output_buffer and time.time() - buffer_timeout > 10:
-                    buffer_timeout = time.time()
-                    # Try to stream output, if we can't connect, then
-                    # keep buffer for the next pass through this
-                    if self.client.post_live_output(
-                        self.job_id, live_output_buffer
-                    ):
-                        live_output_buffer = ""
-            buf = process.stdout.read()
-            if buf:
-                buf = buf.decode(sys.stdout.encoding, errors="replace")
-                sys.stdout.write(buf)
-                live_output_buffer += buf
-                f.write(buf)
-            if live_output_buffer:
-                self.client.post_live_output(self.job_id, live_output_buffer)
-            try:
-                status = process.wait(10)  # process.returncode
-            except TimeoutError:
-                status = 99  # Default in case something goes wrong
-            return status
+            # Check for global timeout for any phase except reserve
+            if (
+                self.phase != "reserve"
+                and time.time() - start_time > global_timeout
+            ):
+                output = (
+                    f"\nERROR: Global timeout reached! ({global_timeout}s)\n"
+                )
+                self._send_output(output, logfile)
+                process.kill()
+                return _get_exit_code(process)
 
     def get_global_timeout(self):
         """Get the global timeout for the test run in seconds"""
@@ -246,14 +241,8 @@ class TestflingerJob:
         yield "*" * (len(line) + 4)
 
 
-def set_nonblock(fd):
-    """Set the specified fd to nonblocking output
-
-    :param fd:
-        File descriptor that should be set to nonblocking mode
-    """
-
-    # XXX: This is only used in one place right now, may want to consider
-    # moving it if it gets wider use in the future
-    fl = fcntl.fcntl(fd, fcntl.F_GETFL)
-    fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+def _get_exit_code(process):
+    try:
+        return process.wait()
+    except TimeoutError:
+        return 99  # Default error in case something goes wrong
