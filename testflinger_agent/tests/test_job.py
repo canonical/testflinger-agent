@@ -63,7 +63,7 @@ class TestJob:
         requests_mock.post(rmock.ANY, status_code=200)
         job = _TestflingerJob(fake_job_data, client)
         job.phase = "test"
-        job.run_with_log("sleep 3", logfile)
+        job.run_with_log("sleep 12", logfile)
         with open(logfile) as log:
             log_data = log.read()
         assert timeout_str == log_data
@@ -77,7 +77,7 @@ class TestJob:
         requests_mock.post(rmock.ANY, status_code=200)
         job = _TestflingerJob(fake_job_data, client)
         job.phase = "test"
-        job.run_with_log("sleep 3", logfile)
+        job.run_with_log("sleep 12", logfile)
         with open(logfile) as log:
             log_data = log.read()
         assert timeout_str == log_data
