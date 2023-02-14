@@ -18,6 +18,9 @@ import multiprocessing
 import os
 import shutil
 import time
+import requests
+from requests.adapters import HTTPAdapter, Retry
+from urllib.parse import urljoin
 
 from testflinger_agent.job import TestflingerJob
 from testflinger_agent.errors import TFServerError
@@ -28,10 +31,22 @@ logger = logging.getLogger(__name__)
 class TestflingerAgent:
     def __init__(self, client):
         self.client = client
+        self.agent = self.client.config.get("agent_id")
+        server = self.client.config.get("server_address")
+        if not server.lower().startswith("http"):
+            server = "http://" + server
+        data_uri = urljoin(server, "/v1/agents/data/")
+        self.data_url = urljoin(data_uri, self.agent)
+        self.session = self._requests_retry()
         self._state = multiprocessing.Array("c", 16)
         self.set_state("waiting")
         self.advertised_queues = self.client.config.get("advertised_queues")
         self.advertised_images = self.client.config.get("advertised_images")
+        location = self.client.config.get("location")
+        if location:
+            self._post_json({"location": location})
+        if self.advertised_queues:
+            self._post_json({"queues": self.advertised_queues})
         if self.advertised_queues or self.advertised_images:
             self.status_proc = multiprocessing.Process(
                 target=self._status_worker
@@ -50,7 +65,32 @@ class TestflingerAgent:
                     self.client.post_images(self.advertised_images)
             time.sleep(120)
 
+    def _requests_retry(self, retries=3):
+        session = requests.Session()
+        retry = Retry(
+            total=retries,
+            read=retries,
+            connect=retries,
+            backoff_factor=0.3,
+            status_forcelist=(500, 502, 503, 504),
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        return session
+
+    def _post_json(self, data):
+        try:
+            self.session.post(
+                url=self.data_url,
+                data=json.dumps(data),
+                headers={"Content-type": "application/json"},
+            )
+        except Exception as e:
+            logger.exception(e)
+
     def set_state(self, state):
+        self._post_json({"state": state})
         self._state.value = state.encode("utf-8")
 
     def get_offline_files(self):
@@ -58,11 +98,10 @@ class TestflingerAgent:
         # i.e. support both:
         #     TESTFLINGER-DEVICE-OFFLINE-devname-001
         #     TESTFLINGER-DEVICE-OFFLINE-devname001
-        agent = self.client.config.get("agent_id")
         files = [
-            "/tmp/TESTFLINGER-DEVICE-OFFLINE-{}".format(agent),
+            "/tmp/TESTFLINGER-DEVICE-OFFLINE-{}".format(self.agent),
             "/tmp/TESTFLINGER-DEVICE-OFFLINE-{}".format(
-                agent.replace("-", "")
+                self.agent.replace("-", "")
             ),
         ]
         return files
@@ -72,11 +111,10 @@ class TestflingerAgent:
         # i.e. support both:
         #     TESTFLINGER-DEVICE-RESTART-devname-001
         #     TESTFLINGER-DEVICE-RESTART-devname001
-        agent = self.client.config.get("agent_id")
         files = [
-            "/tmp/TESTFLINGER-DEVICE-RESTART-{}".format(agent),
+            "/tmp/TESTFLINGER-DEVICE-RESTART-{}".format(self.agent),
             "/tmp/TESTFLINGER-DEVICE-RESTART-{}".format(
-                agent.replace("-", "")
+                self.agent.replace("-", "")
             ),
         ]
         return files
@@ -128,6 +166,7 @@ class TestflingerAgent:
             try:
                 job = TestflingerJob(job_data, self.client)
                 logger.info("Starting job %s", job.job_id)
+                self._post_json({"job_id": job.job_id})
                 rundir = os.path.join(
                     self.client.config.get("execution_basedir"), job.job_id
                 )
