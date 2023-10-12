@@ -101,6 +101,10 @@ The following configuration options are supported:
 
   - Command to run for the provision phase
 
+- **firmware_update_command**:
+
+  - Command to run for the firmware_update phase
+
 - **allocate_command**:
 
   - Command to run for the allocate phase
@@ -140,6 +144,13 @@ The following test phases are currently supported:
     device by installing (if possible) the image requested in the test job.
     If the provision_data section is missing from the job, this phase will
     not run.
+
+- **firmware_update**:
+
+  - This phase is run after the provision phase, and is used to perform 
+    firmware update on the device (if applicable) with the given version in
+    the test job. If the firmware_update_data section is missing from the
+    job, this phase will not run.
 
 - **test**:
   
